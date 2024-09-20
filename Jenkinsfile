@@ -1,0 +1,181 @@
+pipeline {
+    agent any 
+    tools {
+        jdk 'jdk'
+        nodejs 'nodejs'
+    }
+    environment  {
+        SCANNER_HOME=tool 'sonar-scanner'
+    }
+    stages {
+        stage('Cleaning Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Checkout from Git') {
+            steps {
+                git branch: 'master', url: 'https://github.com/Shubh1am/End-to-End-Kubernetes-DevSecOps-Tetris-Project'
+            }
+        }
+        stage('Sonarqube Analysis') {
+            steps {
+                dir('Tetris-V1') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Tetris \
+                        -Dsonar.projectKey=Tetris '''
+                    }
+                }
+            }
+        }
+        stage('Quality Check') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' 
+                }
+            }
+        }
+        stage('Installing Dependencies') {
+            steps {
+                dir('Tetris-V1') {
+                    sh 'npm install'
+                }
+            }
+        }
+//        stage('Deploy to Nexus') {
+//            steps {
+//                sh 'mvn deploy:deploy-file \
+//                    -Dfile=target/your-application.jar \
+//                    -Durl=http://13.127.122.204:32000/releases/ \
+//                    -DrepositoryId=nexus-releases \
+//                    -DgroupId=http://13.127.122.204:32000/repository/nuget-group/ \
+//                    -DartifactId=your-artifact-id \
+//                    -Dversion=${env.BUILD_NUMBER}'
+//            }
+//        }
+        stage('OWASP Dependency-Check Scan') {
+            steps {
+                dir('Tetris-V1') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP'
+                  //  dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+        stage('Trivy File Scan') {
+            steps {
+                dir('Tetris-V1') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+        stage("Docker Image Build") {
+            steps {
+                script {
+                    dir('Tetris-V1') {
+                        withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {   
+                            sh 'docker system prune -f'
+                            sh 'docker container prune -f'
+                            sh 'docker build -t tetrisv1 .'
+                        }
+                    }
+                }
+            }
+        }
+        stage("Docker Image Pushing") {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {   
+                        sh 'docker tag tetrisv1 shubhammutkalwar/tetrisv1:${BUILD_NUMBER}'
+                        sh 'docker push shubhammutkalwar/tetrisv1:${BUILD_NUMBER}'
+                    }
+                }
+            }
+        }
+        stage("TRIVY Image Scan") {
+            steps {
+                sh 'trivy image shubhammutkalwar/tetrisv1:${BUILD_NUMBER} > trivyimage.txt' 
+            }
+        }
+        stage('Checkout Code') {
+            steps {
+                git credentialsId: 'git-cred', url: 'https://github.com/Shubh1am/End-to-End-Kubernetes-DevSecOps-Tetris-Project'
+            }
+        }
+        stage('Update Deployment file') {
+            environment {
+                GIT_REPO_NAME = "End-to-End-Kubernetes-DevSecOps-Tetris-Project"
+                GIT_USER_NAME = "Shubh1am"
+            }
+            steps {
+                dir('Manifest-file') {
+                  // withCredentials([string(credentialsId: 'git-cred', variable: 'GITHUB_TOKEN')]) {
+                 git credentialsId: 'git-cred', url: 'https://github.com/Shubh1am/End-to-End-Kubernetes-DevSecOps-Tetris-Project'
+                       sh '''
+                            #!/bin/bash
+                            git config user.email "shubhammutkalwar@gmail.com"
+                            git config user.name "shubhammutkalwar"
+                            BUILD_NUMBER=${BUILD_NUMBER}
+                            echo $BUILD_NUMBER
+                            imageTag=$(grep -oP '(?<=tetrisv1:)[^ ]+' deployment-service.yml)
+                            echo $imageTag
+                            sed -i "s/tetrisv1:${imageTag}/tetrisv1:${BUILD_NUMBER}/" deployment-service.yml
+                            git add deployment-service.yml
+                            git commit -m "Update deployment Image to version \${BUILD_NUMBER}"
+                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:master
+                        '''
+                    }
+                }
+            }
+
+        stage('Deploy To Kubernetes') {
+            steps {
+               withKubeConfig(caCertificate: '', clusterName: 'kubernetes', contextName: '', credentialsId: 'k8s-cred', namespace: 'tetris', restrictKubeConfigAccess: false, serverUrl: 'https://172.31.6.142:6443/') {
+                        sh "kubectl apply -f deployment-service.yml"
+                }
+            }
+        }
+        
+        stage('Verify the Deployment') {
+            steps {
+               withKubeConfig(caCertificate: '', clusterName: 'kubernetes', contextName: '', credentialsId: 'k8s-cred', namespace: 'tetris', restrictKubeConfigAccess: false, serverUrl: 'https://172.31.6.142:6443/') {
+                        sh "kubectl get pods -n tetris"
+                        sh "kubectl get svc -n tetris"
+                }
+            }
+        }
+    }
+    post {
+    always {
+        script {
+            def jobName = env.JOB_NAME
+            def buildNumber = env.BUILD_NUMBER
+            def pipelineStatus = currentBuild.result ?: 'UNKNOWN'
+            def bannerColor = pipelineStatus.toUpperCase() == 'SUCCESS' ? 'green' : 'red'
+
+            def body = """
+                <html>
+                <body>
+                <div style="border: 4px solid ${bannerColor}; padding: 10px;">
+                <h2>${jobName} - Build ${buildNumber}</h2>
+                <div style="background-color: ${bannerColor}; padding: 10px;">
+                <h3 style="color: white;">Pipeline Status: ${pipelineStatus.toUpperCase()}</h3>
+                </div>
+                <p>Check the <a href="${BUILD_URL}">console output</a>.</p>
+                </div>
+                </body>
+                </html>
+            """
+
+            emailext (
+                subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
+                body: body,
+                to: 'shubhammutkalwar@gmail.com',
+                from: 'jenkins@example.com',
+                replyTo: 'jenkins@example.com',
+                mimeType: 'text/html',
+                attachmentsPattern: 'trivyfs.txt, trivyimage.txt' 
+            )
+        }
+    }
+}
+}
